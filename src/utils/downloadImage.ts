@@ -9,6 +9,15 @@ function isMobile(): boolean {
 }
 
 /**
+ * iOS 기기 또는 Safari(WebKit) 감지
+ * html-to-image는 Safari에서 첫 렌더링 때 내부 이미지를 빠뜨리는 경우가 있어 워밍업이 필요하다.
+ */
+function isWebKit(): boolean {
+  const ua = navigator.userAgent;
+  return /iPhone|iPad|iPod/i.test(ua) || (/Safari/i.test(ua) && !/Chrome|Chromium|CriOS|Android/i.test(ua));
+}
+
+/**
  * 적절한 pixelRatio 계산 (모바일에서는 낮추기)
  */
 function getOptimalPixelRatio(): number {
@@ -17,6 +26,18 @@ function getOptimalPixelRatio(): number {
     return Math.min(window.devicePixelRatio || 1, 2);
   }
   return 2;
+}
+
+/**
+ * 복제할 CSS 속성 목록
+ * 최신 WebKit은 corner-*-shape 속성이 함께 설정되면 border-radius를 `corner:` 축약형으로
+ * 직렬화하는데, SVG로 다시 그릴 때 이 값이 적용되지 않아 둥근 모서리가 모두 사라진다.
+ * corner-shape는 기본값(round)이면 되므로 복제 대상에서 제외한다.
+ */
+function getStyleProperties(): string[] {
+  return Array.from(window.getComputedStyle(document.documentElement)).filter(
+    (name) => !name.startsWith('corner-')
+  );
 }
 
 /**
@@ -31,6 +52,7 @@ function getImageOptions() {
     includeQueryParams: true,
     // 스타일 복사 시 계산된 스타일 사용
     skipAutoScale: true,
+    includeStyleProperties: getStyleProperties(),
   };
 }
 
@@ -49,6 +71,10 @@ async function toPngWithRetry(
       // 첫 시도 전에 약간의 대기 (리소스 로딩 보장)
       if (attempt === 0) {
         await new Promise(r => setTimeout(r, 100));
+        // Safari는 첫 렌더링에서 이미지가 빠지는 경우가 있어 한 번 버리고 다시 그린다
+        if (isWebKit()) {
+          await toPng(element, options).catch(() => undefined);
+        }
       }
 
       const dataUrl = await toPng(element, options);
@@ -120,42 +146,29 @@ async function shareImage(dataUrl: string, filename: string): Promise<boolean> {
 }
 
 /**
- * 새 탭에서 이미지 열기 (fallback)
+ * 파일 다운로드
+ * 큰 data URL을 그대로 href에 넣으면 모바일 브라우저에서 파일이 깨지거나 저장되지 않으므로 Blob URL을 사용한다.
  */
-function openInNewTab(dataUrl: string): void {
-  const newTab = window.open();
-  if (newTab) {
-    newTab.document.write(`
-      <html>
-        <head>
-          <title>V-Archive Tier Card</title>
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <style>
-            body { margin: 0; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #111; }
-            img { max-width: 100%; height: auto; }
-            p { color: #888; text-align: center; padding: 20px; font-family: sans-serif; }
-          </style>
-        </head>
-        <body>
-          <div>
-            <img src="${dataUrl}" alt="Tier Card" />
-            <p>이미지를 길게 눌러 저장하세요</p>
-          </div>
-        </body>
-      </html>
-    `);
-    newTab.document.close();
-  }
+function downloadFile(dataUrl: string, filename: string): void {
+  const url = URL.createObjectURL(dataUrlToBlob(dataUrl));
+  const link = document.createElement('a');
+  link.download = filename;
+  link.href = url;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 /**
- * 데스크톱 다운로드
+ * 생성된 이미지 저장 (모바일은 공유 시트 우선, 실패 시 다운로드)
+ * 생성이 오래 걸리면 사용자 제스처가 만료되어 공유나 window.open이 막히므로 다운로드로 대체한다.
  */
-function downloadFile(dataUrl: string, filename: string): void {
-  const link = document.createElement('a');
-  link.download = filename;
-  link.href = dataUrl;
-  link.click();
+async function saveImage(dataUrl: string, filename: string): Promise<void> {
+  if (isMobile() && (await shareImage(dataUrl, filename))) {
+    return;
+  }
+  downloadFile(dataUrl, filename);
 }
 
 export async function downloadCardAsImage(
@@ -174,16 +187,7 @@ export async function downloadCardAsImage(
       dataUrl = await toPngWithRetry(element);
     }
 
-    if (isMobile()) {
-      // 모바일: Web Share API 시도 → 실패 시 새 탭
-      const shared = await shareImage(dataUrl, filename);
-      if (!shared) {
-        openInNewTab(dataUrl);
-      }
-    } else {
-      // 데스크톱: 일반 다운로드
-      downloadFile(dataUrl, filename);
-    }
+    await saveImage(dataUrl, filename);
   } catch (error) {
     console.error('이미지 다운로드 실패:', error);
     throw error;
@@ -288,24 +292,15 @@ export async function downloadCardAsGif(
     await ensureVideoLoaded(video);
 
     // Canvas 합성 방식으로 프레임 생성
-    const frames = await createFramesWithCanvasComposite(element, video, frameCount);
+    const { frames, width, height } = await createFramesWithCanvasComposite(element, video, frameCount);
 
     if (frames.length === 0) {
       throw new Error('프레임을 캡처하지 못했습니다');
     }
 
-    const gifDataUrl = await createGifFromFrames(frames, frameDuration);
+    const gifDataUrl = await createGifFromFrames(frames, frameDuration, width, height);
 
-    if (isMobile()) {
-      // 모바일: Web Share API 시도 → 실패 시 새 탭
-      const shared = await shareImage(gifDataUrl, filename);
-      if (!shared) {
-        openInNewTab(gifDataUrl);
-      }
-    } else {
-      // 데스크톱: 일반 다운로드
-      downloadFile(gifDataUrl, filename);
-    }
+    await saveImage(gifDataUrl, filename);
   } catch (error) {
     console.error('GIF 다운로드 실패:', error);
     throw error;
@@ -320,7 +315,7 @@ async function createFramesWithCanvasComposite(
   element: HTMLElement,
   video: HTMLVideoElement,
   frameCount: number
-): Promise<string[]> {
+): Promise<{ frames: string[]; width: number; height: number }> {
   const videoParent = video.parentElement;
   if (!videoParent) {
     throw new Error('비디오 부모 요소를 찾을 수 없습니다');
@@ -331,14 +326,6 @@ async function createFramesWithCanvasComposite(
   const videoRect = video.getBoundingClientRect();
 
   const pixelRatio = getOptimalPixelRatio();
-
-  // 카드 내에서 비디오의 상대 위치 (픽셀 비율 적용)
-  const videoPosition = {
-    x: (videoRect.left - cardRect.left) * pixelRatio,
-    y: (videoRect.top - cardRect.top) * pixelRatio,
-    width: videoRect.width * pixelRatio,
-    height: videoRect.height * pixelRatio,
-  };
 
   // 2. 비디오를 투명 placeholder로 교체하고 배경 캡처
   const placeholder = document.createElement('div');
@@ -363,6 +350,16 @@ async function createFramesWithCanvasComposite(
 
   // 3. 배경 이미지 로드
   const backgroundImg = await loadImage(backgroundDataUrl);
+
+  // 카드 내에서 비디오의 상대 위치 (실제 캡처된 배경 크기 기준으로 환산)
+  const scaleX = backgroundImg.width / cardRect.width || pixelRatio;
+  const scaleY = backgroundImg.height / cardRect.height || pixelRatio;
+  const videoPosition = {
+    x: (videoRect.left - cardRect.left) * scaleX,
+    y: (videoRect.top - cardRect.top) * scaleY,
+    width: videoRect.width * scaleX,
+    height: videoRect.height * scaleY,
+  };
 
   // 4. 비디오 프레임들을 캡처하고 배경과 합성
   const frames: string[] = [];
@@ -427,7 +424,12 @@ async function createFramesWithCanvasComposite(
     video.play().catch(() => {});
   }
 
-  return frames;
+  // GIF는 화면에 보이는 카드 크기(CSS px)와 같은 비율로 만든다
+  return {
+    frames,
+    width: Math.round(cardRect.width),
+    height: Math.round(cardRect.height),
+  };
 }
 
 /**
@@ -487,11 +489,11 @@ function waitForVideoSeek(video: HTMLVideoElement): Promise<void> {
 
     video.addEventListener('seeked', onSeeked);
 
-    // 타임아웃 fallback
+    // 타임아웃 fallback (모바일은 seek가 느려 여유를 둔다)
     setTimeout(() => {
       video.removeEventListener('seeked', onSeeked);
       resolve();
-    }, 300);
+    }, isMobile() ? 1000 : 300);
   });
 }
 
@@ -500,7 +502,9 @@ function waitForVideoSeek(video: HTMLVideoElement): Promise<void> {
  */
 function createGifFromFrames(
   frames: string[],
-  frameDuration: number
+  frameDuration: number,
+  width: number,
+  height: number
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     if (frames.length === 0) {
@@ -508,12 +512,12 @@ function createGifFromFrames(
       return;
     }
 
-    // gifshot에 직접 전달 (크기는 자동 감지)
+    // 크기를 고정하면 화면 폭에 따라 카드 비율이 달라지는 모바일에서 GIF가 늘어나 깨진다
     createGIF(
       {
         images: frames,
-        gifWidth: 352,  // 고정 크기 사용
-        gifHeight: 578,
+        gifWidth: width,
+        gifHeight: height,
         frameDuration: frameDuration,
         interval: 0.05,
         numWorkers: 2,
