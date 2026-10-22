@@ -1,0 +1,36 @@
+# Production is Cloudflare Pages (project varchive-card, v-archive-card.bini59.dev): it deploys every push to main itself (Git integration).
+# This workflow only waits for that deploy's result on this commit, so a green "Deploy" run on main means it is live
+# (ticket-pilot reads it: deploy.repos.<repo>.workflow = deploy.yml).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  checks: read
+  statuses: read
+
+jobs:
+  wait:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Wait for "Cloudflare Pages" on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECK: "Cloudflare Pages"
+        run: |
+          for i in $(seq 110); do
+            s=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs" --jq '.check_runs[] | select(.name == env.CHECK) | .conclusion // "pending"')
+            [ -n "$s" ] || s=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status" --jq '.statuses[] | select(.context == env.CHECK) | .state')
+            s=${s%%$'\n'*}
+            echo "$CHECK: ${s:-not started}"
+            case "$s" in
+              success) exit 0 ;;
+              failure|error|cancelled|timed_out|action_required|startup_failure) exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "timed out waiting for $CHECK"; exit 1
